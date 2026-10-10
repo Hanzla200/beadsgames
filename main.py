@@ -1,6 +1,7 @@
 """12 Beads (Bara Tehni) for desktop and Android with Kivy."""
 
 from random import choice
+from math import inf
 
 from kivy.animation import Animation
 from kivy.app import App
@@ -565,19 +566,130 @@ class TwelveBeadsApp(App):
         if (not self.match_started or self.mode != "computer" or self.turn != "green"
                 or self.game_over):
             return
-        if self.chain_piece is not None:
-            source = self.chain_piece
-            moves = [(source, destination, captured)
-                     for destination, captured in self.legal_captures(source)]
-        else:
-            moves = self.moves_for_side("green")
+        moves = ([(self.chain_piece, destination, captured)
+                  for destination, captured in self.legal_captures(self.chain_piece)]
+                 if self.chain_piece is not None else self.moves_for_side("green"))
         if not moves:
             self._finish_turn()
             self.refresh()
             return
-        captures = [move for move in moves if move[2] is not None]
-        source, destination, _captured = choice(captures or moves)
+        self._ai_cache = {}
+        _score, source, destination, _captured = max(
+            ((self._score_computer_move(move), *move) for move in moves),
+            key=lambda item: item[0])
         self.apply_move(source, destination)
+
+    def _score_computer_move(self, move):
+        """Score a green move with alpha-beta search over complete turns."""
+        cells = self.cells[:]
+        source, destination, captured = move
+        cells[source] = None
+        cells[destination] = "green"
+        if captured is not None:
+            cells[captured] = None
+        # Captures continue immediately with the same bead; search the chain
+        # before handing control to red.
+        if captured is not None:
+            chain = self._best_chain_value(cells, destination, "green", 0)
+            if chain is not None:
+                return chain
+        return self._search_position(cells, "red", 4, -inf, inf)
+
+    def _best_chain_value(self, cells, source, side, ply):
+        captures = [(source, dest, taken) for dest, taken
+                    in self.legal_destinations(source, cells) if taken is not None]
+        if not captures:
+            return self._search_position(cells, "red" if side == "green" else "green",
+                                         4, -inf, inf)
+        values = []
+        for start, dest, taken in captures:
+            next_cells = cells[:]
+            next_cells[start] = None
+            next_cells[dest] = side
+            next_cells[taken] = None
+            further = self._best_chain_value(next_cells, dest, side, ply + 1)
+            if further is not None:
+                values.append(further)
+        return (max(values) if side == "green" else min(values)) if values else None
+
+    def _search_position(self, cells, side, depth, alpha, beta):
+        key = (tuple(cells), side, depth)
+        cache = getattr(self, "_ai_cache", {})
+        if key in cache:
+            return cache[key]
+        green = self.count_for(cells, "green")
+        red = self.count_for(cells, "red")
+        if red == 0 or not self._moves_for(cells, "red"):
+            return 10000 + depth
+        if green == 0 or not self._moves_for(cells, "green"):
+            return -10000 - depth
+        if depth == 0:
+            result = self._evaluate(cells)
+            cache[key] = result
+            return result
+
+        moves = self._moves_for(cells, side)
+        maximizing = side == "green"
+        alpha_original, beta_original = alpha, beta
+        best = -inf if maximizing else inf
+        # Try captures first to find strong bounds early and prune more branches.
+        moves.sort(key=lambda move: move[2] is not None, reverse=True)
+        for source, dest, taken in moves:
+            next_cells = cells[:]
+            next_cells[source] = None
+            next_cells[dest] = side
+            if taken is not None:
+                next_cells[taken] = None
+                chain = [(dest, landing, victim) for landing, victim
+                         in self.legal_destinations(dest, next_cells) if victim is not None]
+                if chain:
+                    value = self._search_chain(next_cells, dest, side, depth, alpha, beta)
+                else:
+                    value = self._search_position(next_cells,
+                        "red" if side == "green" else "green", depth - 1, alpha, beta)
+            else:
+                value = self._search_position(next_cells,
+                    "red" if side == "green" else "green", depth - 1, alpha, beta)
+            if maximizing:
+                best, alpha = max(best, value), max(alpha, best)
+            else:
+                best, beta = min(best, value), min(beta, best)
+            if beta <= alpha:
+                break
+        if alpha_original < best < beta_original:
+            cache[key] = best
+        return best
+
+    def _search_chain(self, cells, source, side, depth, alpha, beta):
+        captures = [(source, dest, taken) for dest, taken
+                    in self.legal_destinations(source, cells) if taken is not None]
+        if not captures:
+            return self._search_position(cells, "red" if side == "green" else "green",
+                                         depth - 1, alpha, beta)
+        best = -inf if side == "green" else inf
+        for start, dest, taken in captures:
+            next_cells = cells[:]
+            next_cells[start] = None
+            next_cells[dest] = side
+            next_cells[taken] = None
+            value = self._search_chain(next_cells, dest, side, depth, alpha, beta)
+            if side == "green":
+                best, alpha = max(best, value), max(alpha, best)
+            else:
+                best, beta = min(best, value), min(beta, best)
+            if beta <= alpha:
+                break
+        return best
+
+    def _moves_for(self, cells, side):
+        return [(source, dest, captured) for source, owner in enumerate(cells)
+                if owner == side for dest, captured in self.legal_destinations(source, cells)]
+
+    def _evaluate(self, cells):
+        material = (self.count_for(cells, "green") - self.count_for(cells, "red")) * 100
+        mobility = (len(self._moves_for(cells, "green"))
+                    - len(self._moves_for(cells, "red"))) * 2
+        return material + mobility
 
     def on_pause(self):
         return True
