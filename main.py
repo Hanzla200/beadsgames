@@ -1,7 +1,7 @@
 """12 Beads (Bara Tehni) for desktop and Android with Kivy."""
 
 from random import choice
-from math import inf
+from threading import Thread
 
 from kivy.animation import Animation
 from kivy.app import App
@@ -17,6 +17,7 @@ from kivy.uix.label import Label
 from kivy.uix.popup import Popup
 from kivy.uix.widget import Widget
 from kivy.utils import platform
+from game_engine import GRAPH, Searcher, Step, apply_step, legal_steps
 
 
 BG = (0.055, 0.075, 0.105, 1)
@@ -28,34 +29,6 @@ GREEN = (0.25, 0.75, 0.42, 1)
 TEXT = (0.94, 0.96, 0.98, 1)
 MUTED = (0.59, 0.67, 0.75, 1)
 ACCENT = (0.40, 0.78, 0.91, 1)
-
-
-def make_graph():
-    """Build the 5x5 Alquerque-style board from the connected lines."""
-    graph = {r * 5 + c: set() for r in range(5) for c in range(5)}
-
-    def connect(a, b):
-        graph[a].add(b)
-        graph[b].add(a)
-
-    for row in range(5):
-        for col in range(5):
-            point = row * 5 + col
-            if col < 4:
-                connect(point, point + 1)
-            if row < 4:
-                connect(point, point + 5)
-            # Each small square has one diagonal, alternating direction to
-            # form the larger diamond pattern shown in the reference board.
-            if row < 4 and col < 4:
-                if (row + col) % 2 == 0:
-                    connect(point, point + 6)
-                else:
-                    connect(point + 1, point + 5)
-    return graph
-
-
-GRAPH = make_graph()
 
 
 class Surface(BoxLayout):
@@ -292,6 +265,11 @@ class TwelveBeadsApp(App):
         self.ads = None
         self.message = ""
         self.match_started = False
+        self._ai_generation = 0
+        self._ai_thinking = False
+        self._ai_plan = []
+        self._searcher = Searcher(max_depth=8,
+                                  time_limit=0.25 if platform == "android" else 0.65)
         self.screen = GameScreen(self)
         self.new_game()
         Clock.schedule_once(lambda _dt: self.show_mode_menu(), 0)
@@ -326,6 +304,9 @@ class TwelveBeadsApp(App):
             self.screen.refresh()
 
     def new_game(self):
+        self._ai_generation += 1
+        self._ai_thinking = False
+        self._ai_plan = []
         self.cells = [None] * 25
         for index in list(range(0, 10)) + [10, 11]:
             self.cells[index] = "red"
@@ -473,25 +454,7 @@ class TwelveBeadsApp(App):
 
     def legal_destinations(self, source, cells=None):
         cells = self.cells if cells is None else cells
-        side = cells[source]
-        if side is None:
-            return []
-        moves = []
-        for neighbor in GRAPH[source]:
-            if cells[neighbor] is None:
-                moves.append((neighbor, None))
-                continue
-            if cells[neighbor] == side:
-                continue
-            sr, sc = divmod(source, 5)
-            nr, nc = divmod(neighbor, 5)
-            dr, dc = nr - sr, nc - sc
-            landing_row, landing_col = nr + dr, nc + dc
-            if 0 <= landing_row < 5 and 0 <= landing_col < 5:
-                landing = landing_row * 5 + landing_col
-                if landing in GRAPH[neighbor] and cells[landing] is None:
-                    moves.append((landing, neighbor))
-        return moves
+        return list(legal_steps(tuple(cells), source))
 
     def moves_for_side(self, side, cells=None):
         cells = self.cells if cells is None else cells
@@ -499,7 +462,7 @@ class TwelveBeadsApp(App):
         for source, owner in enumerate(cells):
             if owner == side:
                 moves.extend((source, dest, captured)
-                             for dest, captured in self.legal_destinations(source, cells))
+                             for dest, captured in legal_steps(tuple(cells), source))
         return moves
 
     def apply_move(self, source, destination):
@@ -512,10 +475,8 @@ class TwelveBeadsApp(App):
             return
         captured = options[destination]
         self.custom_on_move(source, destination, side)
-        self.cells[source] = None
-        self.cells[destination] = side
-        if captured is not None:
-            self.cells[captured] = None
+        self.cells = list(apply_step(tuple(self.cells),
+                                     Step(source, destination, captured), side))
         if captured is not None and self.legal_captures(destination):
             self.chain_piece = destination
             self.selected = destination
@@ -566,130 +527,59 @@ class TwelveBeadsApp(App):
         if (not self.match_started or self.mode != "computer" or self.turn != "green"
                 or self.game_over):
             return
-        moves = ([(self.chain_piece, destination, captured)
-                  for destination, captured in self.legal_captures(self.chain_piece)]
-                 if self.chain_piece is not None else self.moves_for_side("green"))
-        if not moves:
+        if self._ai_plan:
+            source, destination, captured = self._ai_plan[0]
+            if (self.cells[source] == "green" and
+                    (destination, captured) in self.destinations_for_selection(source)):
+                self._ai_plan.pop(0)
+                self.apply_move(source, destination)
+                return
+            self._ai_plan = []
+        if self._ai_thinking:
+            return
+        if not self.moves_for_side("green"):
             self._finish_turn()
             self.refresh()
             return
-        self._ai_cache = {}
-        _score, source, destination, _captured = max(
-            ((self._score_computer_move(move), *move) for move in moves),
-            key=lambda item: item[0])
-        self.apply_move(source, destination)
+        self._ai_thinking = True
+        self.message = "Computer is thinking..."
+        self.refresh()
+        generation = self._ai_generation
+        position = tuple(self.cells)
+        forced_source = self.chain_piece
+        searcher = Searcher(max_depth=self._searcher.max_depth,
+                            time_limit=self._searcher.time_limit,
+                            quiescence_depth=self._searcher.quiescence_depth,
+                            weights=self._searcher.weights)
 
-    def _score_computer_move(self, move):
-        """Score a green move with alpha-beta search over complete turns."""
-        cells = self.cells[:]
-        source, destination, captured = move
-        cells[source] = None
-        cells[destination] = "green"
-        if captured is not None:
-            cells[captured] = None
-        # Captures continue immediately with the same bead; search the chain
-        # before handing control to red.
-        if captured is not None:
-            chain = self._best_chain_value(cells, destination, "green", 0)
-            if chain is not None:
-                return chain
-        return self._search_position(cells, "red", 4, -inf, inf)
+        def search_in_background():
+            result = None
+            failure = None
+            try:
+                result = searcher.choose(position, "green", forced_source)
+            except Exception as error:
+                failure = str(error)
+            Clock.schedule_once(
+                lambda _dt: self._finish_computer_search(generation, result, failure), 0)
 
-    def _best_chain_value(self, cells, source, side, ply):
-        captures = [(source, dest, taken) for dest, taken
-                    in self.legal_destinations(source, cells) if taken is not None]
-        if not captures:
-            return self._search_position(cells, "red" if side == "green" else "green",
-                                         4, -inf, inf)
-        values = []
-        for start, dest, taken in captures:
-            next_cells = cells[:]
-            next_cells[start] = None
-            next_cells[dest] = side
-            next_cells[taken] = None
-            further = self._best_chain_value(next_cells, dest, side, ply + 1)
-            if further is not None:
-                values.append(further)
-        return (max(values) if side == "green" else min(values)) if values else None
+        Thread(target=search_in_background, name="12-beads-ai", daemon=True).start()
 
-    def _search_position(self, cells, side, depth, alpha, beta):
-        key = (tuple(cells), side, depth)
-        cache = getattr(self, "_ai_cache", {})
-        if key in cache:
-            return cache[key]
-        green = self.count_for(cells, "green")
-        red = self.count_for(cells, "red")
-        if red == 0 or not self._moves_for(cells, "red"):
-            return 10000 + depth
-        if green == 0 or not self._moves_for(cells, "green"):
-            return -10000 - depth
-        if depth == 0:
-            result = self._evaluate(cells)
-            cache[key] = result
-            return result
-
-        moves = self._moves_for(cells, side)
-        maximizing = side == "green"
-        alpha_original, beta_original = alpha, beta
-        best = -inf if maximizing else inf
-        # Try captures first to find strong bounds early and prune more branches.
-        moves.sort(key=lambda move: move[2] is not None, reverse=True)
-        for source, dest, taken in moves:
-            next_cells = cells[:]
-            next_cells[source] = None
-            next_cells[dest] = side
-            if taken is not None:
-                next_cells[taken] = None
-                chain = [(dest, landing, victim) for landing, victim
-                         in self.legal_destinations(dest, next_cells) if victim is not None]
-                if chain:
-                    value = self._search_chain(next_cells, dest, side, depth, alpha, beta)
-                else:
-                    value = self._search_position(next_cells,
-                        "red" if side == "green" else "green", depth - 1, alpha, beta)
-            else:
-                value = self._search_position(next_cells,
-                    "red" if side == "green" else "green", depth - 1, alpha, beta)
-            if maximizing:
-                best, alpha = max(best, value), max(alpha, best)
-            else:
-                best, beta = min(best, value), min(beta, best)
-            if beta <= alpha:
-                break
-        if alpha_original < best < beta_original:
-            cache[key] = best
-        return best
-
-    def _search_chain(self, cells, source, side, depth, alpha, beta):
-        captures = [(source, dest, taken) for dest, taken
-                    in self.legal_destinations(source, cells) if taken is not None]
-        if not captures:
-            return self._search_position(cells, "red" if side == "green" else "green",
-                                         depth - 1, alpha, beta)
-        best = -inf if side == "green" else inf
-        for start, dest, taken in captures:
-            next_cells = cells[:]
-            next_cells[start] = None
-            next_cells[dest] = side
-            next_cells[taken] = None
-            value = self._search_chain(next_cells, dest, side, depth, alpha, beta)
-            if side == "green":
-                best, alpha = max(best, value), max(alpha, best)
-            else:
-                best, beta = min(best, value), min(beta, best)
-            if beta <= alpha:
-                break
-        return best
-
-    def _moves_for(self, cells, side):
-        return [(source, dest, captured) for source, owner in enumerate(cells)
-                if owner == side for dest, captured in self.legal_destinations(source, cells)]
-
-    def _evaluate(self, cells):
-        material = (self.count_for(cells, "green") - self.count_for(cells, "red")) * 100
-        mobility = (len(self._moves_for(cells, "green"))
-                    - len(self._moves_for(cells, "red"))) * 2
-        return material + mobility
+    def _finish_computer_search(self, generation, result, failure):
+        if generation != self._ai_generation:
+            return
+        self._ai_thinking = False
+        if (not self.match_started or self.mode != "computer" or self.turn != "green"
+                or self.game_over):
+            return
+        if failure:
+            print("Computer search failed:", failure)
+        if result is None or result.action is None:
+            self._finish_turn()
+            self.refresh()
+            return
+        self._ai_plan = [(step.source, step.destination, step.captured)
+                         for step in result.action]
+        self.computer_move(0)
 
     def on_pause(self):
         return True
